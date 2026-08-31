@@ -1344,7 +1344,10 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 let reports = shared_reports.entry(share_id.clone()).or_default();
                 (reports, priv_key, 0)
             } else {
-                let (device, key, idx) = key_map.remove(&payload.id).expect("Not found in key map!");
+                let Some((device, key, idx)) = key_map.remove(&payload.id) else {
+                    warn!("Skipping Find My payload with an unknown lookup key");
+                    continue
+                };
                 let reports = reports.entry(device).or_default();
                 (reports, key, idx)
             };
