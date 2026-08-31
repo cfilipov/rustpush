@@ -1,8 +1,7 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
+use std::{collections::{BTreeMap, HashMap}, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
 
 use aes::{cipher::consts::U16, Aes128, Aes256};
 use aes_gcm::{Aes256Gcm, AesGcm, Nonce, Tag, aead::{Aead, AeadMutInPlace}};
-use chrono::{DateTime, NaiveTime, Utc};
 use cloudkit_derive::CloudKitRecord;
 use deku::{DekuContainerRead, DekuRead};
 use hkdf::Hkdf;
@@ -616,26 +615,71 @@ impl BeaconRatchet {
     }
 }
 
-pub fn count_4am_between_dt(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
-    if end <= start {
-        return 0;
+fn secondary_key_alignments(primary_indices: impl IntoIterator<Item = usize>) -> BTreeMap<usize, usize> {
+    let mut alignments: BTreeMap<usize, usize> = BTreeMap::new();
+    for primary_index in primary_indices {
+        for secondary_index in [primary_index / 96 + 1, primary_index / 96 + 2] {
+            alignments
+                .entry(secondary_index)
+                .and_modify(|alignment| *alignment = (*alignment).max(primary_index))
+                .or_insert(primary_index);
+        }
+    }
+    alignments
+}
+
+const MAX_LOCATION_KEYS_PER_BATCH: usize = 290;
+
+fn batch_location_keys(primary: Vec<String>, secondary: Vec<String>) -> Vec<(Vec<String>, Vec<String>)> {
+    let primary_batches = (primary.len() + MAX_LOCATION_KEYS_PER_BATCH - 1) / MAX_LOCATION_KEYS_PER_BATCH;
+    let secondary_batches = (secondary.len() + MAX_LOCATION_KEYS_PER_BATCH - 1) / MAX_LOCATION_KEYS_PER_BATCH;
+    let batch_count = primary_batches.max(secondary_batches);
+
+    (0..batch_count).map(|batch| {
+        let start = batch * MAX_LOCATION_KEYS_PER_BATCH;
+        let primary_end = (start + MAX_LOCATION_KEYS_PER_BATCH).min(primary.len());
+        let secondary_end = (start + MAX_LOCATION_KEYS_PER_BATCH).min(secondary.len());
+
+        let primary_batch = if start < primary.len() {
+            primary[start..primary_end].to_vec()
+        } else {
+            vec![]
+        };
+        let secondary_batch = if start < secondary.len() {
+            secondary[start..secondary_end].to_vec()
+        } else {
+            vec![]
+        };
+        (primary_batch, secondary_batch)
+    }).collect()
+}
+
+#[cfg(test)]
+mod find_my_key_tests {
+    use super::{batch_location_keys, secondary_key_alignments, MAX_LOCATION_KEYS_PER_BATCH};
+
+    #[test]
+    fn secondary_keys_cover_both_daily_alignment_offsets() {
+        let alignments = secondary_key_alignments([95, 96, 191, 192]);
+
+        assert_eq!(alignments.get(&1), Some(&95));
+        assert_eq!(alignments.get(&2), Some(&191));
+        assert_eq!(alignments.get(&3), Some(&192));
+        assert_eq!(alignments.get(&4), Some(&192));
     }
 
-    // 04:00:00 time-of-day
-    let four = NaiveTime::from_hms_opt(4, 0, 0).unwrap();
+    #[test]
+    fn location_keys_are_split_at_the_service_limit() {
+        let primary = (0..701).map(|index| format!("primary-{index}")).collect::<Vec<_>>();
+        let secondary = (0..3).map(|index| format!("secondary-{index}")).collect::<Vec<_>>();
+        let batches = batch_location_keys(primary.clone(), secondary.clone());
 
-    // 04:00 on the start's calendar day (UTC)
-    let mut first = start.date_naive().and_time(four).and_utc();
-
-    // We want the first 04:00 strictly AFTER `start`
-    if first <= start {
-        first = first + chrono::Duration::days(1);
-    }
-
-    if end < first {
-        0
-    } else {
-        (end - first).num_days() as u64 + 1
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|(primary, secondary)| {
+            primary.len() <= MAX_LOCATION_KEYS_PER_BATCH && secondary.len() <= MAX_LOCATION_KEYS_PER_BATCH
+        }));
+        assert_eq!(batches.iter().flat_map(|(keys, _)| keys.clone()).collect::<Vec<_>>(), primary);
+        assert_eq!(batches.iter().flat_map(|(_, keys)| keys.clone()).collect::<Vec<_>>(), secondary);
     }
 }
 
@@ -718,10 +762,20 @@ impl BeaconAccessory {
         Ok(EcKey::from_private_components(&group, &result, &pub_point)?)
     }
 
-    fn get_current(&mut self) -> Result<Vec<(usize, EcKey<Private>)>, PushError> {
-        let mut primary = self.get_current_primary();
-        primary.extend(self.get_current_secondary());
-        primary.into_iter().map(|i| Ok((i.index, self.derive_ps_key(&i.secret)?))).collect()
+    fn get_current(&mut self) -> Result<(Vec<(usize, EcKey<Private>)>, Vec<(usize, EcKey<Private>)>), PushError> {
+        let primary_ratchets = self.get_current_primary();
+        let secondary_ratchets = self.get_current_secondary(&primary_ratchets)?;
+
+        let primary = primary_ratchets
+            .into_iter()
+            .map(|ratchet| Ok((ratchet.index, self.derive_ps_key(&ratchet.secret)?)))
+            .collect::<Result<Vec<_>, PushError>>()?;
+        let secondary = secondary_ratchets
+            .into_iter()
+            .map(|(alignment_index, ratchet)| Ok((alignment_index, self.derive_ps_key(&ratchet.secret)?)))
+            .collect::<Result<Vec<_>, PushError>>()?;
+
+        Ok((primary, secondary))
     }
 
     fn get_current_primary(&mut self) -> Vec<BeaconRatchet> {
@@ -744,18 +798,26 @@ impl BeaconAccessory {
         self.primary_ratchet.window(slot_window as usize)
     }
 
-    fn get_current_secondary(&mut self) -> Vec<BeaconRatchet> {
-        let rotations = count_4am_between_dt(self.master_record.pairing_date.unwrap().into(), (SystemTime::now() + Duration::from_secs(60 * 60 * 12)).into());
+    fn get_current_secondary(&mut self, primary: &[BeaconRatchet]) -> Result<Vec<(usize, BeaconRatchet)>, PushError> {
+        let alignments = secondary_key_alignments(primary.iter().map(|ratchet| ratchet.index));
+        let Some(first_index) = alignments.keys().next().copied() else {
+            return Ok(vec![]);
+        };
 
-        const LOOKAHEAD_TIME: u64 = 1;
-        const LOOKBACK_TIME: u64 = 7; // week
-        let seek_slots = rotations.saturating_sub(LOOKBACK_TIME);
+        let secondary_secret = self.master_record.shared_secret_2
+            .as_ref()
+            .or(self.master_record.secure_locations_shared_secret.as_ref())
+            .ok_or_else(|| PushError::KeyNotFound("Find My secondary secret".to_string()))?
+            .clone();
+        let mut ratchet = self.secondary_ratchet.seek(first_index, &secondary_secret);
+        let mut secondary = Vec::with_capacity(alignments.len());
 
-        self.secondary_ratchet = self.secondary_ratchet.seek(seek_slots as usize, &self.master_record.shared_secret);
-
-        let slot_window = rotations - seek_slots + LOOKAHEAD_TIME;
-        info!("primary range {}-{}", seek_slots, slot_window + seek_slots);
-        self.secondary_ratchet.window(slot_window as usize)
+        for (secondary_index, alignment_index) in alignments {
+            ratchet = ratchet.seek(secondary_index, &secondary_secret);
+            secondary.push((alignment_index, ratchet.clone()));
+        }
+        self.secondary_ratchet = ratchet;
+        Ok(secondary)
     }
 }
 
@@ -1150,9 +1212,10 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
         let mut search = vec![];
         for (id, device) in &mut state.accessories {
-            let keys = device.get_current()?;
-            let mut device_keys = vec![];
-            for (idx, key) in keys {
+            let (primary, secondary) = device.get_current()?;
+            let mut primary_ids = vec![];
+            let mut secondary_ids = vec![];
+            for (idx, key) in primary {
 
                 let mut x = BigNum::new()?;
                 let mut y = BigNum::new()?;
@@ -1160,18 +1223,28 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
                 let adv = base64_encode(&sha256(&x.to_vec_padded(28)?));
                 key_map.insert(adv.clone(), (id.clone(), key, idx));
-                device_keys.push(adv);
-            
+                primary_ids.push(adv);
             }
-            
-            search.push(json!({
-                "secondaryIds": [],
-                "keyType": 1,
-                "startDate": start_ts,
-                "startDateSecondary": start_ts,
-                "endDate": end_ts,
-                "primaryIds": device_keys,
-            }));
+            for (idx, key) in secondary {
+                let mut x = BigNum::new()?;
+                let mut y = BigNum::new()?;
+                key.public_key().affine_coordinates_gfp(key.group(), &mut x, &mut y, &mut bignum)?;
+
+                let adv = base64_encode(&sha256(&x.to_vec_padded(28)?));
+                key_map.insert(adv.clone(), (id.clone(), key, idx));
+                secondary_ids.push(adv);
+            }
+
+            for (primary_batch, secondary_batch) in batch_location_keys(primary_ids, secondary_ids) {
+                search.push(json!({
+                    "secondaryIds": secondary_batch,
+                    "keyType": 1,
+                    "startDate": start_ts,
+                    "startDateSecondary": start_ts,
+                    "endDate": end_ts,
+                    "primaryIds": primary_batch,
+                }));
+            }
         }
 
         let state = &mut *state;
