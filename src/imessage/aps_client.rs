@@ -6,13 +6,86 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, decode_hex, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
 use rand::RngCore;
 use crate::ids::IDSRecvMessage;
 use async_recursion::async_recursion;
+
+const ASYNC_MESSAGE_COMMAND: u8 = 104;
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+struct AsyncMessageDescriptor {
+    mmcs_owner: String,
+    mmcs_signature_hex: String,
+    mmcs_url: String,
+}
+
+impl AsyncMessageDescriptor {
+    fn signature(&self) -> Result<Vec<u8>, PushError> {
+        if self.mmcs_signature_hex.is_empty() || self.mmcs_signature_hex.len() % 2 != 0 {
+            return Err(PushError::BadMsg);
+        }
+
+        decode_hex(&self.mmcs_signature_hex).map_err(|_| PushError::BadMsg)
+    }
+
+    fn validate(&self) -> Result<(), PushError> {
+        if self.mmcs_owner.is_empty() || self.mmcs_url.is_empty() {
+            return Err(PushError::BadMsg);
+        }
+        self.signature()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod async_message_tests {
+    use plist::{Dictionary, Value};
+
+    use super::AsyncMessageDescriptor;
+    use crate::{ids::MessageBody, PushError};
+
+    fn descriptor(signature: &str) -> MessageBody {
+        let mut value = Dictionary::new();
+        value.insert(
+            "mmcs-owner".to_string(),
+            Value::String("owner-token".to_string()),
+        );
+        value.insert(
+            "mmcs-signature-hex".to_string(),
+            Value::String(signature.to_string()),
+        );
+        value.insert(
+            "mmcs-url".to_string(),
+            Value::String("https://content.icloud.com/owner-token".to_string()),
+        );
+        MessageBody::Plist(Value::Dictionary(value))
+    }
+
+    #[test]
+    fn parses_async_mmcs_descriptor() {
+        let parsed: AsyncMessageDescriptor = descriptor("81010203")
+            .plist()
+            .expect("valid asynchronous message descriptor");
+
+        parsed.validate().expect("valid descriptor fields");
+        assert_eq!(parsed.signature().unwrap(), vec![0x81, 0x01, 0x02, 0x03]);
+        assert_eq!(parsed.mmcs_owner, "owner-token");
+    }
+
+    #[test]
+    fn rejects_malformed_async_mmcs_signature() {
+        let parsed: AsyncMessageDescriptor = descriptor("81010")
+            .plist()
+            .expect("valid descriptor plist");
+
+        assert!(matches!(parsed.validate(), Err(PushError::BadMsg)));
+    }
+}
 
 pub const MADRID_SERVICE: IDSService = IDSService {
     name: "com.apple.madrid",
@@ -359,7 +432,5 @@ impl IMClient {
         self.identity.send_message(topic, ids_message, message_targets).await
     }
 }
-
-
 
 

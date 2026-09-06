@@ -36,6 +36,8 @@ pub struct IDSRecvMessage {
     // all messages
     #[serde(rename = "c")]
     pub command: u8,
+    #[serde(rename = "oC")]
+    pub original_command: Option<u8>,
     #[serde(rename = "e")]
     pub ns_since_epoch: Option<u64>,
 
@@ -102,4 +104,24 @@ pub struct CertifiedContext {
 
 pub mod idsp {
     include!(concat!(env!("OUT_DIR"), "/idsp.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    use plist::{Dictionary, Value};
+
+    use super::IDSRecvMessage;
+
+    #[test]
+    fn parses_original_command() {
+        let mut value = Dictionary::new();
+        value.insert("c".to_string(), Value::Integer(104.into()));
+        value.insert("oC".to_string(), Value::Integer(100.into()));
+
+        let message: IDSRecvMessage =
+            plist::from_value(&Value::Dictionary(value)).expect("valid IDS message");
+
+        assert_eq!(message.command, 104);
+        assert_eq!(message.original_command, Some(100));
+    }
 }
