@@ -773,6 +773,14 @@ impl IdentityResource {
 
         payload.topic = *topic;
 
+        self.decrypt_message_payload(&mut payload).await?;
+
+        Ok(Some(payload))
+    }
+
+    pub(crate) async fn decrypt_message_payload(&self, payload: &mut IDSRecvMessage) -> Result<(), PushError> {
+        let topic = payload.topic;
+
         if let IDSRecvMessage {
             sender: Some(sender),
             target: Some(target),
@@ -782,9 +790,9 @@ impl IdentityResource {
             message_unenc: None,
             verification_failed,
             ..
-        } = &mut payload {
+        } = payload {
             // determine whether or not to refresh keys based on encryption mode
-            let ident = match self.get_key_for_sender(*topic, &target, &encryption, &sender, &token).await {
+            let ident = match self.get_key_for_sender(topic, &target, &encryption, &sender, &token).await {
                 Ok(ident) => Some(ident),
                 Err(err) => {
                     error!("No identity for payload! {}", err);
@@ -799,7 +807,7 @@ impl IdentityResource {
             payload.message_unenc = Some(MessageBody::Bytes(ungzipped));
         }
 
-        Ok(Some(payload))
+        Ok(())
     }
 
     pub fn get_main_service(&self, topic: &'static str) -> &'static str {

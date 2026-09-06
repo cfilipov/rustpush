@@ -16,7 +16,7 @@ use rand::RngCore;
 
 use crate::{OSConfig, aps::{get_message, new_aps_id}, ids::{CertifiedContext, IDSRecvMessage, identity_manager::{IDSSendMessage, MessageTarget, Raw}}, mmcs::{self, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer, put_authorize_body}, util::{KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass, base64_decode, base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string}};
 
-use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
+use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, FileContainer, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
 
 include!("./rawmessages.rs");
@@ -1301,6 +1301,16 @@ impl MMCSFile {
 
     // request to get and download attachment from MMCS
     pub async fn get_attachment(&self, apns: &APSConnectionResource, writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+        let receive_container = IMessageContainer::new(&self.key, writer, true);
+        self.get_attachment_with_container(apns, receive_container, progress).await
+    }
+
+    pub(crate) async fn get_unencrypted_attachment(&self, apns: &APSConnectionResource, writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+        let receive_container = FileContainer::new(writer);
+        self.get_attachment_with_container(apns, receive_container, progress).await
+    }
+
+    async fn get_attachment_with_container(&self, apns: &APSConnectionResource, receive_container: impl WriteContainer + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
         #[derive(Serialize, Deserialize)]
         struct RequestMMCSDownload {
             #[serde(rename = "mO")]
@@ -1336,8 +1346,6 @@ impl MMCSFile {
             extra_1: None,
             extra_2: None,
         };
-
-        let recieve_container = IMessageContainer::new(&self.key, writer, true);
 
         let domain = self.url.replace(&format!("/{}", &self.object), "");
         let msg_id = new_aps_id();
@@ -1384,7 +1392,7 @@ impl MMCSFile {
             dsid: apns_response.object,
         };
 
-        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, recieve_container, None)], progress, false).await?;
+        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, receive_container, None)], progress, false).await?;
 
         Ok(())
     }

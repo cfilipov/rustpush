@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, decode_hex, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::{ErrorMessage, MMCSFile}, util::{bin_deserialize_opt_vec, decode_hex, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
@@ -26,7 +26,13 @@ struct AsyncMessageDescriptor {
 
 impl AsyncMessageDescriptor {
     fn signature(&self) -> Result<Vec<u8>, PushError> {
-        if self.mmcs_signature_hex.is_empty() || self.mmcs_signature_hex.len() % 2 != 0 {
+        if self.mmcs_signature_hex.is_empty()
+            || self.mmcs_signature_hex.len() % 2 != 0
+            || !self
+                .mmcs_signature_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
             return Err(PushError::BadMsg);
         }
 
@@ -80,6 +86,12 @@ mod async_message_tests {
     #[test]
     fn rejects_malformed_async_mmcs_signature() {
         let parsed: AsyncMessageDescriptor = descriptor("81010")
+            .plist()
+            .expect("valid descriptor plist");
+
+        assert!(matches!(parsed.validate(), Err(PushError::BadMsg)));
+
+        let parsed: AsyncMessageDescriptor = descriptor("81éé")
             .plist()
             .expect("valid descriptor plist");
 
@@ -282,7 +294,50 @@ impl IMClient {
         }
     }
     
-    async fn process_msg(&self, mut payload: IDSRecvMessage) -> Result<Option<MessageInst>, PushError> {
+    async fn resolve_async_message(&self, mut payload: IDSRecvMessage) -> Result<IDSRecvMessage, PushError> {
+        if payload.command != ASYNC_MESSAGE_COMMAND {
+            return Ok(payload);
+        }
+
+        let original_command = payload
+            .original_command
+            .filter(|command| *command != ASYNC_MESSAGE_COMMAND)
+            .ok_or(PushError::BadMsg)?;
+        let descriptor: AsyncMessageDescriptor = payload
+            .message_unenc
+            .take()
+            .ok_or(PushError::BadMsg)?
+            .plist()?;
+        descriptor.validate()?;
+
+        info!("Downloading asynchronous IDS payload for command {original_command}");
+        let file = MMCSFile {
+            signature: descriptor.signature()?,
+            object: descriptor.mmcs_owner,
+            url: descriptor.mmcs_url,
+            key: vec![],
+            size: 0,
+        };
+        let mut downloaded = Vec::new();
+        file.get_unencrypted_attachment(&self.conn, &mut downloaded, |_, _| {})
+            .await?;
+        info!("Downloaded asynchronous IDS payload for command {original_command}");
+
+        payload.command = original_command;
+        payload.original_command = None;
+        payload.message = Some(downloaded);
+        payload.message_unenc = None;
+        self.identity.decrypt_message_payload(&mut payload).await?;
+
+        if payload.message_unenc.is_none() {
+            return Err(PushError::BadMsg);
+        }
+
+        Ok(payload)
+    }
+
+    async fn process_msg(&self, payload: IDSRecvMessage) -> Result<Option<MessageInst>, PushError> {
+        let mut payload = self.resolve_async_message(payload).await?;
         let command = payload.command;
         // delivered/read
         if let IDSRecvMessage {
@@ -432,5 +487,3 @@ impl IMClient {
         self.identity.send_message(topic, ids_message, message_targets).await
     }
 }
-
-
