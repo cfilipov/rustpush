@@ -385,8 +385,15 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
     let validation_data = os_config.generate_validation_data().await?;
 
-    let base_headers = account.anisette.lock().await.get_headers().await?.clone();
+    let (base_headers, client_info) = {
+        let mut anisette = account.anisette.lock().await;
+        let headers = anisette.get_headers().await?.clone();
+        let client_info = anisette.provider.authentication_client_info(
+            &os_config.get_mme_clientinfo(&os_config.get_aoskit_version()));
+        (headers, client_info)
+    };
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+    anisette_headers.insert("X-Mme-Client-Info", client_info.parse().unwrap());
 
     if let Some(cookie) = cookie {
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
@@ -395,7 +402,6 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     let resp = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
-            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
             .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers.clone())

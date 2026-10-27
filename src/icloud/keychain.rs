@@ -2120,9 +2120,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());        
         drop(state_lock);
 
-        let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
-
-        base_headers.insert("X-Mme-Client-Info".to_string(), self.config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.sbd/638.100.48)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS")));
+        let mut anisette = self.anisette.lock().await;
+        let mut base_headers = anisette.get_headers().await?.clone();
+        let client_info = self.config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.sbd/638.100.48)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS"));
+        base_headers.insert("X-Mme-Client-Info".to_string(), anisette.provider.authentication_client_info(&client_info));
 
         map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 
