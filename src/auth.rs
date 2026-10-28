@@ -50,6 +50,43 @@ struct V2AuthUserInfo {
     timezone: String,
 }
 
+fn delegate_login_request(legacy: bool, default_url: &'static str, username: &str, pet: &str, delegates: &[LoginDelegate]) -> Result<(&'static str, String), PushError> {
+    let delegates = Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate())));
+    if legacy {
+        // This is the password-equivalent token already obtained directly from
+        // Apple, not the account password. Do not log the serialized request.
+        let request = AuthRequest {
+            apple_id: username.to_owned(),
+            client_id: Uuid::new_v4().to_string(),
+            delegates,
+            password: pet.to_owned(),
+        };
+        Ok(("https://setup.icloud.com/setup/iosbuddy/loginDelegates", plist_to_string(&request)?))
+    } else {
+        let request = V2AuthRequest {
+            delegates,
+            protocol_version: "1.0".to_string(),
+            user_info: V2AuthUserInfo {
+                client_id: Uuid::new_v4().to_string().to_uppercase(),
+                language: "en-US".to_string(),
+                timezone: "America/New_York".to_string(),
+            },
+        };
+        Ok((default_url, plist_to_string(&request)?))
+    }
+}
+
+fn parse_delegate_response(status: reqwest::StatusCode, body: &[u8]) -> Result<Dictionary, PushError> {
+    if !status.is_success() {
+        return Err(PushError::StatusError(status));
+    }
+    plist::from_bytes(body).map_err(|_| PushError::InvalidDelegateResponse { status: status.as_u16(), bytes: body.len() })
+}
+
+#[cfg(test)]
+#[path = "delegate_login_tests.rs"]
+mod delegate_login_tests;
+
 #[derive(Clone, Copy)]
 pub enum LoginDelegate {
     IDS,
@@ -366,31 +403,14 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
     let username = account.username.as_ref().unwrap();
     
-    // let request = AuthRequest {
-    //     apple_id: username.to_string(),
-    //     client_id: Uuid::new_v4().to_string(),
-    //     delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-    //     password: pet.to_string()
-    // };
-
-    let request = V2AuthRequest {
-        delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-        protocol_version: "1.0".to_string(),
-        user_info: V2AuthUserInfo {
-            client_id: Uuid::new_v4().to_string().to_uppercase(),
-            language: "en-US".to_string(),
-            timezone: "America/New_York".to_string(),
-        }
-    };
-
     let validation_data = os_config.generate_validation_data().await?;
 
-    let (base_headers, client_info) = {
+    let (base_headers, client_info, legacy) = {
         let mut anisette = account.anisette.lock().await;
         let headers = anisette.get_headers().await?.clone();
         let client_info = anisette.provider.authentication_client_info(
             &os_config.get_mme_clientinfo(&os_config.get_aoskit_version()));
-        (headers, client_info)
+        (headers, client_info, anisette.provider.uses_legacy_delegate_login())
     };
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
     anisette_headers.insert("X-Mme-Client-Info", client_info.parse().unwrap());
@@ -399,20 +419,22 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
     }
 
-    let resp = REQWEST.post(os_config.get_login_url())
+    let (url, body) = delegate_login_request(legacy, os_config.get_login_url(), username, &pet, delegates)?;
+    let resp = REQWEST.post(url)
+            .header("Content-Type", "application/xml")
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
             .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers.clone())
             .basic_auth(username, Some(pet))
-            .body(plist_to_string(&request)?)
+            .body(body)
+            .timeout(Duration::from_secs(30))
             .send()
             .await?;
-    let text = resp.text().await?;
-
-    let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-    let parsed_dict = parsed.as_dictionary().unwrap();
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    let parsed_dict = parse_delegate_response(status, &bytes)?;
 
     if let Some(error) = parsed_dict.get("localizedError") {
         let error = error.as_string().unwrap();
@@ -423,7 +445,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     }
 
     if parsed_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
-        return Err(PushError::AuthError(parsed.clone()));
+        return Err(PushError::AuthError(Value::Dictionary(parsed_dict.clone())));
     }
 
     fn get_delegate<T: DeserializeOwned>(delegates: &Dictionary, delegate: &str) -> Result<Option<T>, PushError> {

@@ -132,6 +132,8 @@ pub enum PushError {
     ResourceGenTimeout,
     #[error("Delegate {0} login failed status {1} error {2}")]
     DelegateLoginFailed(String, i64, String),
+    #[error("Apple delegate login returned an invalid response (HTTP {status}, {bytes} bytes)")]
+    InvalidDelegateResponse { status: u16, bytes: usize },
     #[error("Cloudkit error {0:?}")]
     CloudKitError(cloudkit_proto::response_operation::Result),
     #[error("NickName Crypto Error: {0}")]
