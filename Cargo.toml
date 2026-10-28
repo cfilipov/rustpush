@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+live-apns-proxy-test = []
 remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
 remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
 macos-validation-data = ["dep:open-absinthe"]

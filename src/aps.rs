@@ -945,6 +945,7 @@ impl APSMessage {
 }
 
 
+#[cfg(feature = "live-apns-proxy-test")]
 #[tokio::test]
 async fn proxy() {
     if let Err(_) = std::env::var("RUST_LOG") {
